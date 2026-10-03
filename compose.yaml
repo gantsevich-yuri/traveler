@@ -1,0 +1,36 @@
+services:
+  flights:
+    build: .
+    image: flights-monitor:latest
+    container_name: flights-monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_FILE: /data/seen.json
+      HEARTBEAT_FILE: /tmp/heartbeat
+      INTERVAL_SEC: "3600"
+    volumes:
+      - flights_data:/data
+    healthcheck:
+      # unhealthy, если последний успешный прогон был > 2 интервалов назад
+      test: ["CMD", "python", "-c",
+             "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/heartbeat')<7500 else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 1
+      start_period: 90s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  flights_data:
