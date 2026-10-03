@@ -1,4 +1,4 @@
-import json, logging, os, random, signal, threading, time
+import json, logging, os, random, re, signal, threading, time
 from datetime import date, datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -87,6 +87,42 @@ def airline_label(code) -> str:
     n = AIRLINES.get(str(code).upper())
     return f"{n} ({code})" if n else str(code)
 
+
+# --- Отдельная выдача по выбранным авиакомпаниям ---
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9а-яё]", "", s.lower())
+
+
+def resolve_airline(token: str) -> str:
+    """'WY', 'Oman Air', 'OmanAir' -> 'WY'"""
+    t = token.strip()
+    if t.upper() in AIRLINES:                       # точный код из справочника
+        return t.upper()
+    by_name = {_norm(name): code for code, name in AIRLINES.items()}
+    n = _norm(t)
+    if n in by_name:
+        return by_name[n]
+    if re.fullmatch(r"[A-Za-z0-9]{2}", t):          # похоже на IATA-код, которого нет в справочнике
+        return t.upper()
+    raise SystemExit(
+        f"WATCH_AIRLINES: не удалось распознать авиакомпанию {token!r}. "
+        f"Укажите двухсимвольный IATA-код (например, WY) или добавьте название "
+        f"в AIRLINE_NAMES, например AIRLINE_NAMES=WY:Oman Air"
+    )
+
+
+def parse_watch(raw: str) -> list:
+    out = []
+    for item in raw.split(","):
+        if item.strip():
+            code = resolve_airline(item)
+            if code not in out:
+                out.append(code)
+    return out
+
+
+WATCH = parse_watch(os.getenv("WATCH_AIRLINES", ""))
+WATCH_MAX_VARIANTS = int(os.getenv("WATCH_MAX_VARIANTS") or MAX_VARIANTS)
 
 CURRENCY_SIGNS = {"rub": "₽", "eur": "€", "usd": "$"}
 
@@ -378,10 +414,12 @@ def transfers_limit_text(max_out, max_back) -> str:
     return f"туда {limit_word(max_out)} / обратно {limit_word(max_back)}"
 
 
-def send_digest(top: list, new_keys: set) -> None:
+def send_digest(top: list, sections: list, new_keys: set) -> None:
+    """top - общий топ; sections - [(код авиакомпании, [варианты])] для WATCH_AIRLINES."""
     route = f"{place(ORIGIN)} → " + ", ".join(place(d) for d, _, _ in DESTINATIONS)
+    scope = " (все авиакомпании)" if WATCH else ""
     lines = [f"✈️ {route}",
-             f"Топ-{len(top)} по цене · бюджет до {money(BUDGET)}"]
+             f"Топ-{len(top)} по цене{scope} · бюджет до {money(BUDGET)}"]
     if ROUND_TRIP:
         lines.append(f"📅 Окно: {DATE_FROM:%d.%m.%Y}–{DATE_TO:%d.%m.%Y} "
                      f"({days_str(WINDOW_DAYS)})")
@@ -396,10 +434,24 @@ def send_digest(top: list, new_keys: set) -> None:
         lines.append("🔁 Макс. пересадок:")
         for d, mo, mb in DESTINATIONS:
             lines.append(f"   • {place_short(d)}: {transfers_limit_text(mo, mb)}")
+    if WATCH:
+        lines.append("🛫 Отдельно по авиакомпаниям: " + ", ".join(airline_label(c) for c in WATCH))
     header = "\n".join(lines)
 
+    # блоки текста; заголовок раздела приклеивается к его первому варианту
     blocks = [format_variant(i, key in new_keys, dest, t)
               for i, (price, key, dest, t) in enumerate(top, 1)]
+
+    for code, items in sections:
+        title = f"━━━━━━━━━━━━\n🛫 Только {airline_label(code)}"
+        if not items:
+            blocks.append(f"{title}\nПодходящих билетов этой авиакомпании нет")
+            continue
+        title += f" · топ-{len(items)} по цене"
+        sec = [format_variant(i, key in new_keys, dest, t)
+               for i, (price, key, dest, t) in enumerate(items, 1)]
+        sec[0] = f"{title}\n\n{sec[0]}"
+        blocks.extend(sec)
 
     chunk = header
     for b in blocks:
@@ -482,8 +534,19 @@ def run_once() -> None:
                     log.warning("%s: у %d билетов нет поля return_transfers, обратный лимит к ним не применён",
                                 dest, no_ret_field)
 
-    top = sorted(found.values(), key=lambda x: (x[0], x[3]["departure_at"]))[:MAX_VARIANTS]
-    new_keys = {key for price, key, _, _ in top
+    ranked = sorted(found.values(), key=lambda x: (x[0], x[3]["departure_at"]))
+    top = ranked[:MAX_VARIANTS]
+
+    # отдельные топы по выбранным авиакомпаниям (из всех подходящих билетов, не только из общего топа)
+    sections = []
+    for code in WATCH:
+        items = [c for c in ranked if str(c[3].get("airline") or "").upper() == code][:WATCH_MAX_VARIANTS]
+        sections.append((code, items))
+        log.info("авиакомпания %s: подходящих билетов %d", airline_label(code),
+                 sum(1 for c in ranked if str(c[3].get("airline") or "").upper() == code))
+
+    shown = list(top) + [c for _, items in sections for c in items]
+    new_keys = {key for price, key, _, _ in shown
                 if key not in seen or price < seen[key]["price"]}
 
     if not top:
@@ -495,14 +558,15 @@ def run_once() -> None:
             _empty_notified = True
     elif new_keys:
         _empty_notified = False
-        send_digest(top, new_keys)
+        send_digest(top, sections, new_keys)
         now = time.time()
-        for price, key, _, _ in top:
+        for price, key, _, _ in shown:
             seen[key] = {"price": price, "ts": now}
-        log.info("sent digest: %d вариантов, из них новых/подешевевших %d", len(top), len(new_keys))
+        log.info("sent digest: %d вариантов в общем топе, отдельных разделов %d, новых/подешевевших %d",
+                 len(top), len(sections), len(new_keys))
     else:
         _empty_notified = False
-        log.info("Новых вариантов нет, в топе те же %d, что уже отправлялись", len(top))
+        log.info("Новых вариантов нет, в выдаче те же %d, что уже отправлялись", len(shown))
     save_seen(seen)
 
 
@@ -523,6 +587,8 @@ def main() -> None:
              f"отпуск от {days_str(MIN_DAYS)}" if ROUND_TRIP else "в одну сторону",
              MAX_VARIANTS, BUDGET, CURRENCY)
     log.info("расписание: %s", sched_s)
+    log.info("отдельная выдача по авиакомпаниям: %s",
+             ", ".join(airline_label(c) for c in WATCH) if WATCH else "выключена")
 
     now = datetime.now(TZ)
     if RUN_ON_START or not SCHEDULE:
